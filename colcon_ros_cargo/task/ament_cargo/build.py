@@ -1,8 +1,10 @@
 # Licensed under the Apache License, Version 2.0
 
+import fcntl
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 
 from colcon_cargo.task.cargo import CARGO_EXECUTABLE
 from colcon_cargo.task.cargo.build import CargoBuildTask
@@ -114,6 +116,11 @@ class AmentCargoBuildTask(CargoBuildTask):
     def write_cargo_config_toml(self, package_paths, config_path=None):
         """Write the resolved package paths to config.toml.
 
+        Uses file locking to serialise concurrent colcon workers and atomic
+        rename so that cargo never reads a partially-written file.  Merges
+        with any existing content written by other workers and stubs paths
+        that do not yet contain a valid Cargo manifest.
+
         :param package_paths: A mapping of package names to paths
         :param config_path: Optional path for .cargo/config.toml
         """
@@ -135,12 +142,97 @@ class AmentCargoBuildTask(CargoBuildTask):
                     'in a way it will be hit by cargo')
         config_dir.mkdir(exist_ok=True)
         cargo_config_toml_out = config_dir / 'config.toml'
+        lock_path = config_dir / 'config.toml.lock'
 
-        patches = {pkg: {'path': str(path)}
-                   for pkg, path in package_paths.items()}
-        content = {'patch': {'crates-io': patches}}
-        with cargo_config_toml_out.open('w') as toml_file:
-            toml.dump(content, toml_file)
+        with open(lock_path, 'w') as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                # Merge with paths already written by other workers.
+                merged = dict(package_paths)
+                if cargo_config_toml_out.exists():
+                    try:
+                        existing = toml.load(str(cargo_config_toml_out))
+                        for name, info in existing.get('patch', {}).get(
+                                'crates-io', {}).items():
+                            merged.setdefault(name, info['path'])
+                    except Exception:
+                        pass
+
+                # Ensure every referenced path has a parseable manifest.
+                for pkg, path in merged.items():
+                    _stub_missing_cargo_toml(pkg, path)
+
+                patches = {pkg: {'path': str(path)}
+                           for pkg, path in merged.items()}
+                content = {'patch': {'crates-io': patches}}
+
+                # Atomic write via temp-file + rename.
+                fd, tmp = tempfile.mkstemp(
+                    dir=str(config_dir), suffix='.tmp', prefix='config_')
+                try:
+                    with os.fdopen(fd, 'w') as f:
+                        toml.dump(content, f)
+                    os.replace(tmp, str(cargo_config_toml_out))
+                except BaseException:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _stub_missing_cargo_toml(pkg, path, _visited=None):
+    """Create a stub Cargo package at path if Cargo.toml does not exist.
+
+    Cargo validates every [patch.crates-io] entry, including transitive
+    path dependencies.  When a patched path does not yet contain a valid
+    Cargo manifest (e.g. the package has not been installed yet), builds
+    of unrelated packages fail.  This function creates a minimal stub so
+    that cargo can parse the manifest graph.
+
+    Only creates files when Cargo.toml is truly absent, to avoid racing
+    with cargo-ament-build's remove_dir_all during a parallel install.
+    """
+    if _visited is None:
+        _visited = set()
+    try:
+        real = str(Path(path).resolve())
+    except OSError:
+        return
+    if real in _visited:
+        return
+    _visited.add(real)
+
+    try:
+        pkg_dir = Path(path)
+        manifest = pkg_dir / 'Cargo.toml'
+        if not manifest.exists():
+            pkg_dir.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(
+                '[package]\nname = "{}"\nversion = "0.0.0"\n'
+                'edition = "2021"\n\n[lib]\npath = "src/lib.rs"\n'
+                .format(pkg)
+            )
+            src_dir = pkg_dir / 'src'
+            src_dir.mkdir(parents=True, exist_ok=True)
+            (src_dir / 'lib.rs').write_text('')
+
+        # Recursively stub transitive path dependencies.
+        try:
+            cargo_toml = toml.load(str(manifest))
+            for section in ('dependencies', 'dev-dependencies',
+                            'build-dependencies'):
+                for dep_name, spec in cargo_toml.get(section, {}).items():
+                    if isinstance(spec, dict) and 'path' in spec:
+                        dep_path = (pkg_dir / spec['path']).resolve()
+                        _stub_missing_cargo_toml(
+                            dep_name, str(dep_path), _visited)
+        except Exception:
+            pass
+    except OSError:
+        pass
 
 
 def write_cargo_config_toml(package_paths):
